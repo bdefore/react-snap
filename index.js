@@ -12,6 +12,8 @@ const minimalcss = require("minimalcss");
 const CleanCSS = require("clean-css");
 const twentyKb = 20 * 1024;
 
+const HOST = 'jp.neimanmarcus.localised-staging.com'
+
 const defaultOptions = {
   //# stable configurations
   port: 45678,
@@ -149,7 +151,7 @@ const preloadResources = opt => {
     if (/^data:|blob:/i.test(responseUrl)) return;
     const ct = response.headers()["content-type"] || "";
     const route = responseUrl.replace(basePath, "");
-    if (/^http:\/\/localhost/i.test(responseUrl)) {
+    if (new RegExp(`/^https?:\/\/${HOST}/i`).test(responseUrl)) {
       if (uniqueResources.has(responseUrl)) return;
       if (preloadImages && /\.(png|jpg|jpeg|webp|gif|svg)$/.test(responseUrl)) {
         if (http2PushManifest) {
@@ -542,167 +544,176 @@ const run = async (userOptions, { fs } = { fs: nativeFs }) => {
 
   const server = options.externalServer ? null : startServer(options);
 
-  const basePath = `http://localhost:${options.port}`;
+  const basePath = `https://${HOST}:${options.port}`;
+  console.log('basepath', basePath)
+
   const publicPath = options.publicPath;
   const ajaxCache = {};
   const { http2PushManifest } = options;
   const http2PushManifestItems = {};
 
-  await crawl({
-    options,
-    basePath,
-    publicPath,
-    sourceDir,
-    beforeFetch: async ({ page, route }) => {
-      const {
-        preloadImages,
-        cacheAjaxRequests,
-        preconnectThirdParty
-      } = options;
-      if (
-        preloadImages ||
-        cacheAjaxRequests ||
-        preconnectThirdParty ||
-        http2PushManifest
-      ) {
-        const { ajaxCache: ac, http2PushManifestItems: hpm } = preloadResources(
-          {
+  try {
+
+    await crawl({
+      options,
+      basePath,
+      publicPath,
+      sourceDir,
+      beforeFetch: async ({ page, route }) => {
+        console.log('beforeFetch')
+        const {
+          preloadImages,
+          cacheAjaxRequests,
+          preconnectThirdParty
+        } = options;
+        if (
+          preloadImages ||
+          cacheAjaxRequests ||
+          preconnectThirdParty ||
+          http2PushManifest
+        ) {
+          const { ajaxCache: ac, http2PushManifestItems: hpm } = preloadResources(
+            {
+              page,
+              basePath,
+              preloadImages,
+              cacheAjaxRequests,
+              preconnectThirdParty,
+              http2PushManifest,
+              ignoreForPreload: options.ignoreForPreload
+            }
+          );
+          ajaxCache[route] = ac;
+          http2PushManifestItems[route] = hpm;
+        }
+      },
+      afterFetch: async ({ page, route, browser }) => {
+        console.log('afterFetch')
+        const pageUrl = `${basePath}${route}`;
+        if (options.removeStyleTags) await removeStyleTags({ page });
+        if (options.removeScriptTags) await removeScriptTags({ page });
+        if (options.removeBlobs) await removeBlobs({ page });
+        if (options.inlineCss) {
+          const { cssFiles } = await inlineCss({
+            page,
+            pageUrl,
+            options,
+            basePath,
+            browser
+          });
+
+          if (http2PushManifest) {
+            const filesToRemove = cssFiles
+              .filter(file => file.startsWith(basePath))
+              .map(file => file.replace(basePath, ""));
+
+            for (let i = http2PushManifestItems[route].length - 1; i >= 0; i--) {
+              const x = http2PushManifestItems[route][i];
+              filesToRemove.forEach(fileToRemove => {
+                if (x.link.startsWith(fileToRemove)) {
+                  http2PushManifestItems[route].splice(i, 1);
+                }
+              });
+            }
+          }
+        }
+        if (options.fixWebpackChunksIssue) {
+          await fixWebpackChunksIssue({
             page,
             basePath,
-            preloadImages,
-            cacheAjaxRequests,
-            preconnectThirdParty,
             http2PushManifest,
-            ignoreForPreload: options.ignoreForPreload
-          }
-        );
-        ajaxCache[route] = ac;
-        http2PushManifestItems[route] = hpm;
-      }
-    },
-    afterFetch: async ({ page, route, browser }) => {
-      const pageUrl = `${basePath}${route}`;
-      if (options.removeStyleTags) await removeStyleTags({ page });
-      if (options.removeScriptTags) await removeScriptTags({ page });
-      if (options.removeBlobs) await removeBlobs({ page });
-      if (options.inlineCss) {
-        const { cssFiles } = await inlineCss({
-          page,
-          pageUrl,
-          options,
-          basePath,
-          browser
-        });
+            inlineCss: options.inlineCss
+          });
+        }
+        if (options.asyncScriptTags) await asyncScriptTags({ page });
 
+        await page.evaluate(ajaxCache => {
+          const snapEscape = (() => {
+            const UNSAFE_CHARS_REGEXP = /[<>\/\u2028\u2029]/g;
+            // Mapping of unsafe HTML and invalid JavaScript line terminator chars to their
+            // Unicode char counterparts which are safe to use in JavaScript strings.
+            const ESCAPED_CHARS = {
+              "<": "\\u003C",
+              ">": "\\u003E",
+              "/": "\\u002F",
+              "\u2028": "\\u2028",
+              "\u2029": "\\u2029"
+            };
+            const escapeUnsafeChars = unsafeChar => ESCAPED_CHARS[unsafeChar];
+            return str => str.replace(UNSAFE_CHARS_REGEXP, escapeUnsafeChars);
+          })();
+          // TODO: as of now it only prevents XSS attack,
+          // but can stringify only basic data types
+          // e.g. Date, Set, Map, NaN won't be handled right
+          const snapStringify = obj => snapEscape(JSON.stringify(obj));
+
+          let scriptTagText = "";
+          if (ajaxCache && Object.keys(ajaxCache).length > 0) {
+            scriptTagText += `window.snapStore=${snapEscape(
+              JSON.stringify(ajaxCache)
+            )};`;
+          }
+          let state;
+          if (
+            window.snapSaveState &&
+            (state = window.snapSaveState()) &&
+            Object.keys(state).length !== 0
+          ) {
+            scriptTagText += Object.keys(state)
+              .map(key => `window["${key}"]=${snapStringify(state[key])};`)
+              .join("");
+          }
+          if (scriptTagText !== "") {
+            const scriptTag = document.createElement("script");
+            scriptTag.type = "text/javascript";
+            scriptTag.text = scriptTagText;
+            const firstScript = Array.from(document.scripts)[0];
+            firstScript.parentNode.insertBefore(scriptTag, firstScript);
+          }
+        }, ajaxCache[route]);
+        delete ajaxCache[route];
+        if (options.fixInsertRule) await fixInsertRule({ page });
+        await fixFormFields({ page });
+
+        const routePath = route.replace(publicPath, "");
+        const filePath = path.join(destinationDir, routePath);
+        if (options.saveAs === "html") {
+          await saveAsHtml({ page, filePath, options, route, fs });
+        } else if (options.saveAs === "png") {
+          await saveAsPng({ page, filePath, options, route, fs });
+        }
+      },
+      onEnd: () => {
+        if (server) server.close();
         if (http2PushManifest) {
-          const filesToRemove = cssFiles
-            .filter(file => file.startsWith(basePath))
-            .map(file => file.replace(basePath, ""));
-
-          for (let i = http2PushManifestItems[route].length - 1; i >= 0; i--) {
-            const x = http2PushManifestItems[route][i];
-            filesToRemove.forEach(fileToRemove => {
-              if (x.link.startsWith(fileToRemove)) {
-                http2PushManifestItems[route].splice(i, 1);
-              }
-            });
-          }
+          const manifest = Object.keys(http2PushManifestItems).reduce(
+            (accumulator, key) => {
+              if (http2PushManifestItems[key].length !== 0)
+                accumulator.push({
+                  source: key,
+                  headers: [
+                    {
+                      key: "Link",
+                      value: http2PushManifestItems[key]
+                        .map(x => `<${x.link}>;rel=preload;as=${x.as}`)
+                        .join(",")
+                    }
+                  ]
+                });
+              return accumulator;
+            },
+            []
+          );
+          fs.writeFileSync(
+            `${destinationDir}/http2-push-manifest.json`,
+            JSON.stringify(manifest)
+          );
         }
       }
-      if (options.fixWebpackChunksIssue) {
-        await fixWebpackChunksIssue({
-          page,
-          basePath,
-          http2PushManifest,
-          inlineCss: options.inlineCss
-        });
-      }
-      if (options.asyncScriptTags) await asyncScriptTags({ page });
-
-      await page.evaluate(ajaxCache => {
-        const snapEscape = (() => {
-          const UNSAFE_CHARS_REGEXP = /[<>\/\u2028\u2029]/g;
-          // Mapping of unsafe HTML and invalid JavaScript line terminator chars to their
-          // Unicode char counterparts which are safe to use in JavaScript strings.
-          const ESCAPED_CHARS = {
-            "<": "\\u003C",
-            ">": "\\u003E",
-            "/": "\\u002F",
-            "\u2028": "\\u2028",
-            "\u2029": "\\u2029"
-          };
-          const escapeUnsafeChars = unsafeChar => ESCAPED_CHARS[unsafeChar];
-          return str => str.replace(UNSAFE_CHARS_REGEXP, escapeUnsafeChars);
-        })();
-        // TODO: as of now it only prevents XSS attack,
-        // but can stringify only basic data types
-        // e.g. Date, Set, Map, NaN won't be handled right
-        const snapStringify = obj => snapEscape(JSON.stringify(obj));
-
-        let scriptTagText = "";
-        if (ajaxCache && Object.keys(ajaxCache).length > 0) {
-          scriptTagText += `window.snapStore=${snapEscape(
-            JSON.stringify(ajaxCache)
-          )};`;
-        }
-        let state;
-        if (
-          window.snapSaveState &&
-          (state = window.snapSaveState()) &&
-          Object.keys(state).length !== 0
-        ) {
-          scriptTagText += Object.keys(state)
-            .map(key => `window["${key}"]=${snapStringify(state[key])};`)
-            .join("");
-        }
-        if (scriptTagText !== "") {
-          const scriptTag = document.createElement("script");
-          scriptTag.type = "text/javascript";
-          scriptTag.text = scriptTagText;
-          const firstScript = Array.from(document.scripts)[0];
-          firstScript.parentNode.insertBefore(scriptTag, firstScript);
-        }
-      }, ajaxCache[route]);
-      delete ajaxCache[route];
-      if (options.fixInsertRule) await fixInsertRule({ page });
-      await fixFormFields({ page });
-
-      const routePath = route.replace(publicPath, "");
-      const filePath = path.join(destinationDir, routePath);
-      if (options.saveAs === "html") {
-        await saveAsHtml({ page, filePath, options, route, fs });
-      } else if (options.saveAs === "png") {
-        await saveAsPng({ page, filePath, options, route, fs });
-      }
-    },
-    onEnd: () => {
-      if (server) server.close();
-      if (http2PushManifest) {
-        const manifest = Object.keys(http2PushManifestItems).reduce(
-          (accumulator, key) => {
-            if (http2PushManifestItems[key].length !== 0)
-              accumulator.push({
-                source: key,
-                headers: [
-                  {
-                    key: "Link",
-                    value: http2PushManifestItems[key]
-                      .map(x => `<${x.link}>;rel=preload;as=${x.as}`)
-                      .join(",")
-                  }
-                ]
-              });
-            return accumulator;
-          },
-          []
-        );
-        fs.writeFileSync(
-          `${destinationDir}/http2-push-manifest.json`,
-          JSON.stringify(manifest)
-        );
-      }
-    }
-  });
+    });
+  } catch (e) {
+    console.log('Error crawling', e)
+  }
 };
 
 exports.defaultOptions = defaultOptions;

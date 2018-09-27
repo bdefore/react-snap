@@ -6,6 +6,8 @@ const path = require("path");
 const fs = require("fs");
 const {createTracker, augmentTimeoutError} = require("./tracker");
 
+const HOST = 'jp.neimanmarcus.localised-staging.com'
+
 /**
  * @param {{page: Page, options: {skipThirdPartyRequests: true}, basePath: string }} opt
  * @return {Promise<void>}
@@ -74,7 +76,7 @@ const enableLogging = opt => {
     if (response.status() >= 400) {
       let route = ''
       try {
-        route = response._request.headers().referer.replace(`http://localhost:${options.port}`, "");
+        route = response._request.headers().referer.replace(`${HOST}:${options.port}`, "");
       } catch (e) {}
       console.log(`️️️⚠️  warning at ${route}: got ${response.status()} HTTP code for ${response.url()}`);
     }
@@ -118,6 +120,7 @@ const crawl = async opt => {
   } = opt;
   let shuttingDown = false;
   let streamClosed = false;
+  console.log('crawl', JSON.stringify(opt))
 
   const onSigint = () => {
     if (shuttingDown) {
@@ -151,7 +154,7 @@ const crawl = async opt => {
   const addToQueue = newUrl => {
     const { hostname, search, hash } = url.parse(newUrl);
     newUrl = newUrl.replace(`${search || ""}${hash || ""}`, "");
-    if (hostname === "localhost" && !uniqueUrls.has(newUrl) && !streamClosed) {
+    if (hostname === HOST && !uniqueUrls.has(newUrl) && !streamClosed) {
       uniqueUrls.add(newUrl);
       enqued++;
       queue.write(newUrl);
@@ -161,6 +164,7 @@ const crawl = async opt => {
     }
   };
 
+  console.log('launching puppeteer')
   const browser = await puppeteer.launch({
     headless: options.headless,
     args: options.puppeteerArgs,
@@ -168,6 +172,7 @@ const crawl = async opt => {
     ignoreHTTPSErrors: options.puppeteerIgnoreHTTPSErrors,
     handleSIGINT: false
   });
+  console.log('puppeteer launched')
 
   /**
    * @param {string} pageUrl
@@ -175,6 +180,7 @@ const crawl = async opt => {
    */
   const fetchPage = async pageUrl => {
     const route = pageUrl.replace(basePath, "");
+    console.log(`page fetched at ${route}`)
 
     let skipExistingFile = false;
     const routePath = route.replace(/\//g, path.sep);
@@ -241,9 +247,14 @@ const crawl = async opt => {
     options.include.map(x => addToQueue(`${basePath}${x}`));
   }
 
+  console.log('crawl returning promise')
   return new Promise((resolve, reject) => {
+    console.log('queue', queue)
     queue
-      .map(x => _(fetchPage(x)))
+      .map(x => {
+        console.log('fetch page', x)
+        return _(fetchPage(x))
+      })
       .mergeWithLimit(options.concurrency)
       .toArray(async () => {
         process.removeListener("SIGINT", onSigint);
