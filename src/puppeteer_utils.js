@@ -196,7 +196,7 @@ const crawl = async opt => {
           options,
           route,
           onError: () => {
-            shuttingDown = true;
+            shuttingDown = !options.puppeteerIgnoreHTTPSErrors;
           },
           sourcemapStore
         });
